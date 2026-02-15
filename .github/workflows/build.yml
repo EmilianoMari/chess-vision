@@ -1,0 +1,182 @@
+name: Docker Build & Deploy to Nomad
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      full_image: ${{ steps.meta.outputs.full_image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          REPO_NAME="chess-vision"
+          OWNER_NAME=$(dirname "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          IMAGE_TAG="prod-${SHORT_SHA}"
+
+          echo "repo-name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "owner-name=$OWNER_NAME" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "full_image=ghcr.io/${OWNER_NAME}/${REPO_NAME}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner-name }}/${{ steps.meta.outputs.repo-name }}:latest
+            ghcr.io/${{ steps.meta.outputs.owner-name }}/${{ steps.meta.outputs.repo-name }}:${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-to-nomad:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Nomad CLI
+        run: |
+          wget -q https://releases.hashicorp.com/nomad/1.11.1/nomad_1.11.1_linux_amd64.zip
+          unzip -o -q nomad_1.11.1_linux_amd64.zip
+          sudo mv nomad /usr/local/bin/
+          nomad version
+
+      - name: Setup Nomad Pack
+        run: |
+          wget -q https://releases.hashicorp.com/nomad-pack/0.4.1/nomad-pack_0.4.1_linux_amd64.zip
+          unzip -o -q nomad-pack_0.4.1_linux_amd64.zip
+          sudo mv nomad-pack /usr/local/bin/
+          nomad-pack version
+
+      - name: Checkout seas-infra
+        uses: actions/checkout@v4
+        with:
+          repository: emilianomari/seas-infra
+          token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          path: seas-infra
+
+      - name: Test Cloudflare Access authentication
+        env:
+          NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_CLIENT_SECRET }}
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+            "$NOMAD_ADDR/v1/status/leader")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "Authentication successful"
+          else
+            echo "Authentication failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+      - name: Deploy chess-vision to Nomad
+        env:
+          NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_CLIENT_SECRET }}
+          FULL_IMAGE: ${{ needs.build-and-push.outputs.full_image }}
+        run: |
+          cd seas-infra
+
+          PACK_PATH="packs/chess-vision"
+
+          echo "============================================"
+          echo "Deploying image: $FULL_IMAGE"
+          echo "============================================"
+
+          # Render pack with specific image tag
+          IMAGE_BASE=$(echo "$FULL_IMAGE" | cut -d':' -f1)
+          IMAGE_TAG=$(echo "$FULL_IMAGE" | cut -d':' -f2)
+
+          RENDERED=$(nomad-pack render "$PACK_PATH" \
+            --var="image=$IMAGE_BASE" \
+            --var="image_tag=$IMAGE_TAG" 2>&1)
+          RENDER_EXIT=$?
+
+          if [ $RENDER_EXIT -ne 0 ]; then
+            echo "Failed to render pack"
+            echo "$RENDERED"
+            exit 1
+          fi
+
+          echo "Pack rendered successfully"
+
+          # Save rendered job
+          TEMP_JOB="/tmp/chess-vision.nomad"
+          echo "$RENDERED" | tail -n +3 > "$TEMP_JOB"
+
+          # Convert to JSON
+          JOB_JSON=$(nomad job run -output "$TEMP_JOB" 2>&1)
+          JSON_EXIT=$?
+
+          if [ $JSON_EXIT -ne 0 ]; then
+            echo "Failed to parse job"
+            echo "$JOB_JSON"
+            exit 1
+          fi
+
+          JOB_NAME=$(echo "$JOB_JSON" | jq -r '.Job.ID')
+          echo "Deploying job: $JOB_NAME"
+
+          # Deploy via API with Cloudflare Access
+          DEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$JOB_JSON" \
+            "$NOMAD_ADDR/v1/jobs")
+
+          DEPLOY_CODE=$(echo "$DEPLOY_RESPONSE" | tail -n 1)
+          DEPLOY_BODY=$(echo "$DEPLOY_RESPONSE" | head -n -1)
+
+          if [ "$DEPLOY_CODE" -ge 200 ] && [ "$DEPLOY_CODE" -lt 300 ]; then
+            echo "============================================"
+            echo "Successfully deployed: $JOB_NAME"
+            echo "============================================"
+            EVAL_ID=$(echo "$DEPLOY_BODY" | jq -r '.EvalID // empty')
+            if [ -n "$EVAL_ID" ]; then
+              echo "Evaluation ID: $EVAL_ID"
+            fi
+          else
+            echo "Deployment failed (HTTP $DEPLOY_CODE)"
+            echo "$DEPLOY_BODY" | jq '.' 2>/dev/null || echo "$DEPLOY_BODY"
+            exit 1
+          fi
+
+          rm -f "$TEMP_JOB"

@@ -1,0 +1,52 @@
+# Chess Vision Backend Dependencies
+# Python 3.11+
+
+# ===========================
+# Web Framework
+# ===========================
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+gunicorn==23.0.0
+python-multipart==0.0.20
+
+# ===========================
+# ML & Computer Vision
+# ===========================
+# PyTorch (CPU version for now, can switch to CUDA if needed)
+torch==2.5.1
+torchvision==0.20.1
+
+# ONNX Runtime for optimized inference
+onnxruntime==1.20.1
+
+# YOLOv8
+ultralytics==8.3.64
+
+# Image processing
+opencv-python-headless==4.10.0.84
+Pillow==11.1.0
+albumentations==1.4.23
+
+# Core ML libraries
+numpy==2.2.3
+scikit-learn==1.6.1
+
+# ===========================
+# Chess Logic
+# ===========================
+python-chess==1.999
+
+# ===========================
+# Utilities
+# ===========================
+pydantic==2.10.6
+pydantic-settings==2.7.1
+httpx==0.28.1
+aiofiles==24.1.0
+
+# Logging & monitoring
+structlog==25.1.0
+python-json-logger==3.2.1
+
+# Configuration
+python-dotenv==1.0.1
