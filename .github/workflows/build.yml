@@ -82,6 +82,7 @@ jobs:
         with:
           repository: emilianomari/seas-infra
           token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          persist-credentials: false
           path: seas-infra
 
       - name: Test Cloudflare Access authentication
